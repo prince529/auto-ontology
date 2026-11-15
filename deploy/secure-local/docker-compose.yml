@@ -1,0 +1,185 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TEMPORARY single-host profile of the published 1.2.0 images.
+#
+# This is not the production install. Production is the Helm chart
+# `auto-ontology` 1.2.0 from https://helm.ngc.nvidia.com/nvidia, with TLS,
+# `appUrl` set to the real origin, and secrets supplied outside git.
+# This file is the Docker Compose path from DEPLOYMENT-equivalent one-machine
+# operation, with two constraints the root docker-compose.yml does not meet:
+#
+#   * The only published port is 127.0.0.1:3000 (the authenticated web app).
+#   * Postgres, the backend, the ingestion worker, and pgAdmin are not
+#     published. pgAdmin is omitted; the chart already allows
+#     `pgadmin.enabled=false`.
+#
+# Images are the public NGC releases (anonymous `docker pull` verified),
+# pinned by digest. Sample data is the in-repo Pagila fixture, loaded into a
+# second database on the same Postgres. It is not Wide World Importers and it
+# is not enterprise data.
+
+name: auto-ontology-secure
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17@sha256:b513c48566e4777cd3370451400000c78eda6a08131d68f4c31d4a76f27bd8fd
+    container_name: ao-secure-postgres
+    restart: unless-stopped
+    # No ports. Host access is not part of this profile.
+    env_file:
+      - runtime/postgres.env
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - max_connections=30
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - huge_pages=off
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sample/init-pagila.sh:/docker-entrypoint-initdb.d/10-pagila.sh:ro
+      - ./sample/pagila.sql:/sample/pagila.sql:ro
+      - ./sample/pagila_analytics.sql:/sample/pagila_analytics.sql:ro
+    shm_size: 128mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  auto-ontology-migrate:
+    image: nvcr.io/nvidia/auto-ontology:1.2.0@sha256:8348e54e2d733b25dbc17a19172be6c1e3b128c84296da8b465ddcab8d250e3e
+    container_name: ao-secure-migrate
+    env_file:
+      - runtime/db.env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+    command: ["migrate"]
+    restart: "no"
+    # The image HEALTHCHECK probes the API port. This one-shot job never
+    # listens there, so leave the check off or `compose up --wait` never returns.
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend-migrate:
+    image: nvcr.io/nvidia/auto-ontology-frontend:1.2.0@sha256:df3562b159faa86c624d0a6c1a25321a4ce5398a5a29e76ebc4a5f125623a95b
+    container_name: ao-secure-frontend-migrate
+    working_dir: /app/migrate
+    env_file:
+      - runtime/db.env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+    command: ["sh", "prisma/migrate.sh"]
+    restart: "no"
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  auto-ontology:
+    image: nvcr.io/nvidia/auto-ontology:1.2.0@sha256:8348e54e2d733b25dbc17a19172be6c1e3b128c84296da8b465ddcab8d250e3e
+    container_name: ao-secure-backend
+    restart: unless-stopped
+    env_file:
+      - runtime/db.env
+      - runtime/models.env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      INGESTION_SERVICE_URL: http://ingestion-service:3002
+    depends_on:
+      postgres:
+        condition: service_started
+      auto-ontology-migrate:
+        condition: service_completed_successfully
+      ingestion-service:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:3001/api/health/live', timeout=3).status == 200 else 1)\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+
+  ingestion-service:
+    image: nvcr.io/nvidia/auto-ontology:1.2.0@sha256:8348e54e2d733b25dbc17a19172be6c1e3b128c84296da8b465ddcab8d250e3e
+    container_name: ao-secure-ingestion
+    restart: unless-stopped
+    command: ["ingestion_service"]
+    env_file:
+      - runtime/db.env
+      - runtime/models.env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+    depends_on:
+      postgres:
+        condition: service_started
+      auto-ontology-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:3002/health/live', timeout=3).status == 200 else 1)\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  auto-ontology-frontend:
+    image: nvcr.io/nvidia/auto-ontology-frontend:1.2.0@sha256:df3562b159faa86c624d0a6c1a25321a4ce5398a5a29e76ebc4a5f125623a95b
+    container_name: ao-secure-frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - runtime/db.env
+      - runtime/frontend.env
+    environment:
+      PYTHON_API_URL: http://auto-ontology:3001
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+    depends_on:
+      auto-ontology:
+        condition: service_healthy
+      frontend-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"require('http').get('http://127.0.0.1:3000/login',(r)=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+networks:
+  default:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: ao-secure0
+
+volumes:
+  postgres_data:

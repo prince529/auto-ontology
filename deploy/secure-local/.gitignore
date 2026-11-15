@@ -1,0 +1,12 @@
+# Generated on the deploy host. Contains passwords and, after key injection,
+# the NVIDIA API key. Never commit this directory.
+runtime/
+
+# Staged by scripts/up.sh or scripts/pack-config.sh from dev_tools/fixtures/sql.
+sample/pagila.sql
+sample/pagila_analytics.sql
+
+# Offline image archives are produced for handoff, not stored in git.
+images/
+*.tar
+*.tar.gz
